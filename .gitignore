@@ -1,0 +1,21 @@
+# Build outputs
+/bootstrap
+/ec2poller
+/bootstrap.zip
+*.exe
+*.out
+
+# Go tooling
+coverage.out
+coverage.html
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
