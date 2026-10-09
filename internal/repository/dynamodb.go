@@ -1,5 +1,5 @@
-// Package repository implementa el acceso a estados, locks y logs de robots
-// almacenados en DynamoDB.
+// Package repository implementa el acceso a estados y locks de robots en
+// DynamoDB, y el guardado de logs de error en S3.
 package repository
 
 import (
@@ -18,25 +18,27 @@ import (
 )
 
 // RobotRepository contiene el cliente DynamoDB y la configuracion de la tabla
-// usada para leer estados y registrar ejecuciones.
+// usada para leer estados y registrar ejecuciones. Los logs de error ya no se
+// guardan en DynamoDB sino en S3, a traves de logs (inmediato en Lambda, por
+// lotes en EC2).
 type RobotRepository struct {
 	client      *dynamodb.Client
 	tableName   string
 	gsiByClient string
 	lockTTL     time.Duration
-	logTTL      time.Duration
+	logs        ErrorLogger
 }
 
 // NewRobotRepository crea un repositorio para la tabla y el GSI indicados.
-// lockTTL controla cuanto tiempo permanece vigente un lock y logTTL define
-// la expiracion de los items LOG mediante el atributo ttl.
-func NewRobotRepository(client *dynamodb.Client, tableName string, gsiByClient string, lockTTL time.Duration, logTTL time.Duration) *RobotRepository {
+// lockTTL controla cuanto tiempo permanece vigente un lock y logs es quien
+// guarda en S3 los logs de las ejecuciones con error.
+func NewRobotRepository(client *dynamodb.Client, tableName string, gsiByClient string, lockTTL time.Duration, logs ErrorLogger) *RobotRepository {
 	return &RobotRepository{
 		client:      client,
 		tableName:   tableName,
 		gsiByClient: gsiByClient,
 		lockTTL:     lockTTL,
-		logTTL:      logTTL,
+		logs:        logs,
 	}
 }
 
@@ -229,24 +231,37 @@ func (r *RobotRepository) ReleaseLock(ctx context.Context, robotId string) error
 	return err
 }
 
-// RecordExecution actualiza el STATE y agrega un nuevo item LOG para la
-// ejecucion indicada.
+// RecordExecution actualiza el STATE de la ejecucion indicada. Solo cuando la
+// ejecucion fallo guarda ademas un log en S3 y deja en el STATE una referencia
+// (last_error_key) para localizarlo. Las ejecuciones correctas no generan log.
 func (r *RobotRepository) RecordExecution(ctx context.Context, robotId string, result models.ExecutionResult) error {
 	now := time.Now().UTC()
-	nowStr := now.Format(time.RFC3339)
 
-	if err := r.updateStateAfterExecution(ctx, robotId, now, result); err != nil {
+	var errorKey string
+	var logErr error
+
+	if result.Status == "FAILURE" {
+		errorKey, logErr = r.logs.SaveError(ctx, robotId, now, result)
+	}
+
+	// El STATE se actualiza siempre, aunque falle el guardado en S3: asi
+	// last_execution_at avanza y el robot no se reejecuta en bucle.
+	if err := r.updateStateAfterExecution(ctx, robotId, now, result, errorKey); err != nil {
 		return fmt.Errorf("update state: %w", err)
 	}
 
-	if err := r.insertLog(ctx, robotId, nowStr, now, result); err != nil {
-		return fmt.Errorf("insert log: %w", err)
+	if logErr != nil {
+		return fmt.Errorf("save error log: %w", logErr)
 	}
 
 	return nil
 }
 
-func (r *RobotRepository) updateStateAfterExecution(ctx context.Context, robotId string, now time.Time, result models.ExecutionResult) error {
+// maxStateErrorLen limita el mensaje de error copiado al STATE para que el
+// item siga siendo liviano; el mensaje completo vive en el log de S3.
+const maxStateErrorLen = 300
+
+func (r *RobotRepository) updateStateAfterExecution(ctx context.Context, robotId string, now time.Time, result models.ExecutionResult, errorKey string) error {
 	upd := expression.Set(expression.Name("last_execution_at"), expression.Value(now.Unix())).
 		Set(expression.Name("last_status"), expression.Value(result.Status)).
 		Set(expression.Name("last_duration_ms"), expression.Value(result.DurationMs)).
@@ -257,6 +272,20 @@ func (r *RobotRepository) updateStateAfterExecution(ctx context.Context, robotId
 			expression.Name("ult_id"),
 			expression.Value(*result.LastId),
 		)
+	}
+
+	if result.Status == "FAILURE" {
+		msg := result.ErrorMsg
+		if len(msg) > maxStateErrorLen {
+			msg = msg[:maxStateErrorLen]
+		}
+
+		upd = upd.Set(expression.Name("last_error_at"), expression.Value(now.Unix())).
+			Set(expression.Name("last_error_message"), expression.Value(msg))
+
+		if errorKey != "" {
+			upd = upd.Set(expression.Name("last_error_key"), expression.Value(errorKey))
+		}
 	}
 
 	exprBuilder, err := expression.NewBuilder().WithUpdate(upd).Build()
@@ -276,23 +305,5 @@ func (r *RobotRepository) updateStateAfterExecution(ctx context.Context, robotId
 		ExpressionAttributeValues: exprBuilder.Values(),
 	})
 
-	return err
-}
-
-func (r *RobotRepository) insertLog(ctx context.Context, robotId, nowStr string, now time.Time, result models.ExecutionResult) error {
-	item := map[string]types.AttributeValue{
-		"PK":            &types.AttributeValueMemberS{Value: pk(robotId)},
-		"SK":            &types.AttributeValueMemberS{Value: "LOG#" + nowStr},
-		"status":        &types.AttributeValueMemberS{Value: result.Status},
-		"http_code":     &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", result.HttpCode)},
-		"duration_ms":   &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", result.DurationMs)},
-		"error_message": &types.AttributeValueMemberS{Value: result.ErrorMsg},
-		"ttl":           &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", now.Add(r.logTTL).Unix())},
-	}
-
-	_, err := r.client.PutItem(ctx, &dynamodb.PutItemInput{
-		TableName: aws.String(r.tableName),
-		Item:      item,
-	})
 	return err
 }

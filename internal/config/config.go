@@ -12,7 +12,10 @@ type Config struct {
 	TableName              string
 	GSIByClientName        string
 	LockTTL                uint16 // segundos
-	LogTTLDays             uint8
+	LogsBucket             string // bucket S3 donde se guardan los logs de errores
+	LogsPrefix             string // prefijo (carpeta) dentro del bucket
+	LogsFlushIntervalSec   uint16 // EC2: cada cuanto se sube un lote de errores abierto
+	LogsBatchMaxEntries    uint16 // EC2: errores por lote antes de subirlo sin esperar el intervalo
 	HttpTimeoutSec         uint8
 	MaxConcurrency         uint8 // robots procesados en paralelo por invocación
 	EC2PollIntervalSeconds uint8
@@ -26,10 +29,13 @@ func Load() Config {
 		TableName:              getEnv("ROBOTS_TABLE_NAME", "robots"),
 		GSIByClientName:        getEnv("GSI_BY_CLIENT_NAME", "gsi-by-client"),
 		LockTTL:                120,
-		LogTTLDays:             30,
+		LogsBucket:             getEnv("LOGS_BUCKET", ""),
+		LogsPrefix:             getEnv("LOGS_PREFIX", "logs"),
+		LogsFlushIntervalSec:   getEnvUint16("LOGS_FLUSH_INTERVAL_SECONDS", 300),
+		LogsBatchMaxEntries:    getEnvUint16("LOGS_BATCH_MAX_ENTRIES", 100),
 		HttpTimeoutSec:         30,
-		MaxConcurrency:         getEnvInt("MAX_CONCURRENCY", 5),
-		EC2PollIntervalSeconds: getEnvInt("EC2_POLL_INTERVAL_SECONDS", 5),
+		MaxConcurrency:         getEnvUint8("MAX_CONCURRENCY", 5),
+		EC2PollIntervalSeconds: getEnvUint8("EC2_POLL_INTERVAL_SECONDS", 5),
 	}
 }
 
@@ -41,10 +47,19 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-func getEnvInt(key string, fallback uint8) uint8 {
+func getEnvUint8(key string, fallback uint8) uint8 {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return uint8(n)
+		}
+	}
+	return fallback
+}
+
+func getEnvUint16(key string, fallback uint16) uint16 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 16); err == nil {
+			return uint16(n)
 		}
 	}
 	return fallback

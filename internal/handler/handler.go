@@ -4,6 +4,7 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"sync"
@@ -39,6 +40,13 @@ func FastTier(state models.RobotState) bool {
 func StandardTier(state models.RobotState) bool {
 	return state.IntervalSecs >= 60
 }
+
+// bookkeepingTimeout es el presupuesto de tiempo propio que se le da a
+// las operaciones de "contabilidad" (lock y registro de resultado) en
+// DynamoDB, independiente del tiempo que haya consumido la llamada HTTP
+// al endpoint del robot. Sin esto, un endpoint lento puede agotar el
+// presupuesto compartido y dejar el lock sin liberar.
+const bookkeepingTimeout = 10 * time.Second
 
 // Handler coordina una ejecucion de cliente usando un repositorio y un caller
 // HTTP, con un limite de concurrencia por invocacion.
@@ -104,10 +112,43 @@ func (h *Handler) Handle(ctx context.Context) (models.PollExecutionSummary, erro
 	}
 
 	if summary.Failed > 0 {
-		return summary, fmt.Errorf("%d de %d robots fallaron", summary.Failed, summary.TotalDue)
+		return summary, buildFailureError(summary, results)
 	}
 
 	return summary, nil
+}
+
+// FailureDetail describe un robot específico que falló, pensado para que
+// el campo errorMessage de Lambda (que solo acepta string) siga siendo
+// diagnosticable sin tener que ir a CloudWatch a buscar logs sueltos.
+type FailureDetail struct {
+	RobotID string `json:"robot_id"`
+	Reason  string `json:"reason"`
+}
+
+// buildFailureError arma un mensaje de error que incluye, como JSON
+// embebido, el detalle de cada robot que falló (nunca los que tuvieron
+// éxito o fueron omitidos por lock).
+func buildFailureError(summary models.PollExecutionSummary, results []models.ExecutionResult) error {
+	failures := make([]FailureDetail, 0, summary.Failed)
+	for _, r := range results {
+		if r.Status != "SUCCESS" && r.Status != "SKIPPED_LOCKED" {
+			failures = append(failures, FailureDetail{
+				RobotID: r.RobotID,
+				Reason:  r.ErrorMsg,
+			})
+		}
+	}
+
+	detailsJSON, jsonErr := json.Marshal(failures)
+	if jsonErr != nil {
+		// Fallback defensivo: si por algún motivo el marshal falla (no
+		// debería, son tipos simples), al menos no perdemos el conteo.
+		return fmt.Errorf("%d de %d robots fallaron (no se pudo serializar el detalle: %v)",
+			summary.Failed, summary.TotalDue, jsonErr)
+	}
+
+	return fmt.Errorf("%d de %d robots fallaron: %s", summary.Failed, summary.TotalDue, string(detailsJSON))
 }
 
 // executeAll ejecuta los robots debidos en paralelo, limitando la concurrencia
@@ -132,11 +173,21 @@ func (h *Handler) executeAll(ctx context.Context, due []models.RobotState) []mod
 	return results
 }
 
+// detachedContext crea un contexto con su propio timeout fresco, sin
+// heredar el deadline (posiblemente ya vencido) del contexto padre —
+// pero conservando sus valores. Requiere Go 1.21+ por context.WithoutCancel.
+func detachedContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), timeout)
+}
+
 // executeOne maneja el lock, la llamada HTTP y el registro de un unico robot.
 // Los errores de este robot se convierten en resultado y no detienen a los
 // demas robots.
 func (h *Handler) executeOne(ctx context.Context, state models.RobotState) models.ExecutionResult {
-	locked, err := h.repo.TryAcquireLock(ctx, state.RobotID)
+	lockCtx, cancelLock := detachedContext(ctx, bookkeepingTimeout)
+	defer cancelLock()
+
+	locked, err := h.repo.TryAcquireLock(lockCtx, state.RobotID)
 
 	if err != nil {
 		return models.ExecutionResult{
@@ -153,7 +204,18 @@ func (h *Handler) executeOne(ctx context.Context, state models.RobotState) model
 		}
 	}
 
-	defer h.repo.ReleaseLock(ctx, state.RobotID)
+	// El release SIEMPRE debe intentarse, incluso si el ctx original ya
+	// expiró por culpa de una llamada HTTP lenta — por eso usa su propio
+	// contexto desacoplado, no el ctx recibido como parámetro.
+	defer func() {
+		releaseCtx, cancelRelease := detachedContext(ctx, bookkeepingTimeout)
+		defer cancelRelease()
+		if releaseErr := h.repo.ReleaseLock(releaseCtx, state.RobotID); releaseErr != nil {
+			// No hay a quién propagar este error desde un defer, pero al
+			// menos lo dejamos en el log del proceso para poder detectarlo.
+			fmt.Printf("WARN: no se pudo liberar el lock de %s: %v\n", state.RobotID, releaseErr)
+		}
+	}()
 
 	endpointUrl, err := addLastId(state.EndpointURL, state.LastId)
 
@@ -183,7 +245,12 @@ func (h *Handler) executeOne(ctx context.Context, state models.RobotState) model
 		result.Status = "SUCCESS"
 	}
 
-	if recErr := h.repo.RecordExecution(ctx, state.RobotID, result); recErr != nil {
+	// El registro del resultado también usa su propio presupuesto fresco,
+	// independiente de cuánto haya tardado la llamada HTTP.
+	recordCtx, cancelRecord := detachedContext(ctx, bookkeepingTimeout)
+	defer cancelRecord()
+
+	if recErr := h.repo.RecordExecution(recordCtx, state.RobotID, result); recErr != nil {
 		// el robot sí se ejecutó, pero no pudimos registrar el resultado;
 		// lo marcamos como fallo para que quede visible en el summary,
 		// aunque el HttpCode/DurationMs reales ya están en el result.

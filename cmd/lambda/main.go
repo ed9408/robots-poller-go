@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	appconfig "orchestrator/internal/config"
 	"orchestrator/internal/handler"
@@ -25,6 +26,10 @@ var h *handler.Handler
 func init() {
 	cfg := appconfig.Load()
 
+	if cfg.LogsBucket == "" {
+		panic("LOGS_BUCKET es obligatoria: bucket S3 para los logs de errores")
+	}
+
 	awsCfg, err := config.LoadDefaultConfig(context.TODO())
 
 	if err != nil {
@@ -32,12 +37,19 @@ func init() {
 	}
 
 	dbClient := dynamodb.NewFromConfig(awsCfg)
+	s3Client := s3.NewFromConfig(awsCfg)
+
+	// En Lambda cada error se sube de inmediato a S3 (sin lotes): el entorno
+	// de ejecucion puede congelarse o destruirse entre invocaciones, y un
+	// buffer en memoria perderia errores.
+	logStore := repository.NewErrorLogStore(s3Client, cfg.LogsBucket, cfg.LogsPrefix)
+
 	repo := repository.NewRobotRepository(
 		dbClient,
 		cfg.TableName,
 		cfg.GSIByClientName,
 		time.Duration(cfg.LockTTL)*time.Second,
-		time.Duration(cfg.LogTTLDays)*24*time.Hour,
+		logStore,
 	)
 	caller := httpclient.NewRobotCaller(time.Duration(cfg.HttpTimeoutSec) * time.Second)
 
