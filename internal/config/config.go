@@ -12,10 +12,6 @@ type Config struct {
 	TableName              string
 	GSIByClientName        string
 	LockTTL                uint16 // segundos
-	LogsBucket             string // bucket S3 donde se guardan los logs de errores
-	LogsPrefix             string // prefijo (carpeta) dentro del bucket
-	LogsFlushIntervalSec   uint16 // EC2: cada cuanto se sube un lote de errores abierto
-	LogsBatchMaxEntries    uint16 // EC2: errores por lote antes de subirlo sin esperar el intervalo
 	HttpTimeoutSec         uint8
 	MaxConcurrency         uint8 // robots procesados en paralelo por invocación
 	EC2PollIntervalSeconds uint8
@@ -29,10 +25,6 @@ func Load() Config {
 		TableName:              getEnv("ROBOTS_TABLE_NAME", "robots"),
 		GSIByClientName:        getEnv("GSI_BY_CLIENT_NAME", "gsi-by-client"),
 		LockTTL:                120,
-		LogsBucket:             getEnv("LOGS_BUCKET", ""),
-		LogsPrefix:             getEnv("LOGS_PREFIX", "logs"),
-		LogsFlushIntervalSec:   getEnvUint16("LOGS_FLUSH_INTERVAL_SECONDS", 300),
-		LogsBatchMaxEntries:    getEnvUint16("LOGS_BATCH_MAX_ENTRIES", 100),
 		HttpTimeoutSec:         30,
 		MaxConcurrency:         getEnvUint8("MAX_CONCURRENCY", 5),
 		EC2PollIntervalSeconds: getEnvUint8("EC2_POLL_INTERVAL_SECONDS", 5),

@@ -9,7 +9,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	appconfig "orchestrator/internal/config"
 	"orchestrator/internal/handler"
@@ -27,23 +26,12 @@ func main() {
 	}
 
 	ddbClient := dynamodb.NewFromConfig(awsCfg)
-	s3Client := s3.NewFromConfig(awsCfg)
-
-	// En EC2 los errores se agrupan en lotes por robot y se suben cada
-	// LogsFlushIntervalSec (o al llegar a LogsBatchMaxEntries errores).
-	logStore := repository.NewErrorLogStore(s3Client, cfg.LogsBucket, cfg.LogsPrefix)
-	batchStore := repository.NewBatchingErrorLogStore(
-		logStore,
-		time.Duration(cfg.LogsFlushIntervalSec)*time.Second,
-		int(cfg.LogsBatchMaxEntries),
-	)
 
 	repo := repository.NewRobotRepository(
 		ddbClient,
 		cfg.TableName,
 		cfg.GSIByClientName,
 		time.Duration(cfg.LockTTL)*time.Second,
-		batchStore,
 	)
 
 	caller := httpclient.NewRobotCaller(time.Duration(cfg.HttpTimeoutSec) * time.Second)
@@ -59,25 +47,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	// El worker de lotes usa su propio contexto: debe seguir vivo hasta que
-	// termine el ultimo ciclo, porque ese ciclo todavia puede registrar
-	// errores (por ejemplo, llamadas HTTP canceladas por el apagado).
-	flushCtx, stopFlush := context.WithCancel(context.Background())
-	flushDone := make(chan struct{})
-
-	go func() {
-		defer close(flushDone)
-		batchStore.Run(flushCtx)
-	}()
-
 	log.Printf("ec2poller iniciado, tick cada %s", tickInterval)
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("señal de apagado recibida, cerrando ec2poller")
-			stopFlush()
-			<-flushDone // espera el volcado final de lotes a S3
 			return
 
 		case <-ticker.C:
